@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, Upload, FileText, X, Bot, User, Sparkles, MessageCircle } from 'lucide-react'
+import { Send, Upload, FileText, X, Bot, User, Sparkles, MessageCircle, Users } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
 import api from '../api/axios'
 import { useResumes } from '../hooks/useResumes'
 import { getErrorMessage } from '../utils/errorHandler'
+import { ChatbotMultiResponse } from '../types'
 
 // Helper function to clean markdown formatting
 const cleanMarkdown = (text: string): string => {
@@ -27,6 +28,18 @@ const cleanMarkdown = (text: string): string => {
   return cleaned
 }
 
+const formatMultiChatResponse = (payload: ChatbotMultiResponse): string => {
+  const resumeSummaries = payload.resumes
+    .map((resume, index) => {
+      const label = resume.filename ?? `Resume ${index + 1}`
+      const sourceSummary = resume.source ? `\n${resume.source}` : ''
+      return `**${label}**${sourceSummary}`
+    })
+    .join('\n\n')
+
+  return resumeSummaries ? `${payload.response}\n\n${resumeSummaries}` : payload.response
+}
+
 interface Message {
   role: 'user' | 'assistant'
   content: string
@@ -45,10 +58,13 @@ export default function ChatbotTab() {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [selectedResumeId, setSelectedResumeId] = useState<string>('')
+  const [chatMode, setChatMode] = useState<'single' | 'multi'>('single')
+  const [multiResumeIds, setMultiResumeIds] = useState<string[]>([])
   const [uploadedFile, setUploadedFile] = useState<File | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [uploading, setUploading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const isMultiMode = chatMode === 'multi'
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -57,6 +73,28 @@ export default function ChatbotTab() {
   useEffect(() => {
     scrollToBottom()
   }, [messages])
+
+  const handleChatModeChange = useCallback((mode: 'single' | 'multi') => {
+    setChatMode(mode)
+    if (mode === 'single') {
+      setMultiResumeIds([])
+    } else {
+      setSelectedResumeId('')
+    }
+  }, [])
+
+  const toggleMultiResume = useCallback((resumeId: string) => {
+    setMultiResumeIds((prev) =>
+      prev.includes(resumeId)
+        ? prev.filter((id) => id !== resumeId)
+        : [...prev, resumeId]
+    )
+  }, [])
+
+  const isResumeSelected = useCallback(
+    (resumeId: string) => multiResumeIds.includes(resumeId),
+    [multiResumeIds]
+  )
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -99,7 +137,13 @@ export default function ChatbotTab() {
 
       if (response.data.resumes && response.data.resumes.length > 0) {
         const newResumeId = response.data.resumes[0].id
-        setSelectedResumeId(newResumeId)
+        if (isMultiMode) {
+          setMultiResumeIds((prev) =>
+            prev.includes(newResumeId) ? prev : [...prev, newResumeId]
+          )
+        } else {
+          setSelectedResumeId(newResumeId)
+        }
         setUploadedFile(file)
         addMessage('assistant', `Great! I've uploaded "${file.name}". You can now ask me to analyze it, check it against a job description, or get optimization suggestions.`)
       }
@@ -115,44 +159,59 @@ export default function ChatbotTab() {
   }
 
   const handleSend = async () => {
-    if (!input.trim() && !selectedResumeId) return
-
     const userMessage = input.trim()
-    if (userMessage) {
-      addMessage('user', userMessage)
-      setInput('')
+    if (!userMessage) return
+
+    if (isMultiMode && multiResumeIds.length < 2) {
+      addMessage('assistant', 'Select at least two resumes to start a multi-resume conversation.')
+      return
     }
 
+    addMessage('user', userMessage)
+    setInput('')
     setLoading(true)
 
     try {
-      // Check if user wants to analyze or optimize
       const lowerMessage = userMessage.toLowerCase()
-      let response
+      let response: string
 
-      if (lowerMessage.includes('analyze') || lowerMessage.includes('analysis')) {
-        // Use analyze endpoint
-        if (!selectedResumeId) {
-          addMessage('assistant', 'Please upload or select a resume first to analyze it.')
-          setLoading(false)
+      if (isMultiMode) {
+        if (
+          lowerMessage.includes('analyze') ||
+          lowerMessage.includes('analysis') ||
+          lowerMessage.includes('optimize') ||
+          lowerMessage.includes('suggestions')
+        ) {
+          addMessage('assistant', 'Bulk resume analysis happens in the Results tab. Switch to single mode for targeted analysis or keep chatting here about multiple resumes.')
           return
         }
 
+        const multiChatResponse = await api.post<ChatbotMultiResponse>('/chatbot/chat-multi', {
+          message: userMessage,
+          resume_ids: multiResumeIds
+        })
+
+        response = formatMultiChatResponse(multiChatResponse.data)
+      } else if (lowerMessage.includes('analyze') || lowerMessage.includes('analysis')) {
+        if (!selectedResumeId) {
+          addMessage('assistant', 'Please upload or select a resume first to analyze it.')
+          return
+        }
         const analyzeResponse = await api.post('/chatbot/analyze', {
           resume_id: selectedResumeId,
           job_description: lowerMessage.includes('job') ? userMessage : undefined,
           analysis_focus: extractAnalysisFocus(userMessage)
         })
         response = analyzeResponse.data.analysis
-      } else if (lowerMessage.includes('optimize') || lowerMessage.includes('suggestions') || lowerMessage.includes('improve')) {
-        // Use optimize endpoint
+      } else if (
+        lowerMessage.includes('optimize') ||
+        lowerMessage.includes('suggestions') ||
+        lowerMessage.includes('improve')
+      ) {
         if (!selectedResumeId) {
           addMessage('assistant', 'Please upload or select a resume first to get optimization suggestions.')
-          setLoading(false)
           return
         }
-
-        // Extract job description from message
         const jobDescMatch = userMessage.match(/job description[:\s]+(.*)/i)
         const jobDesc = jobDescMatch ? jobDescMatch[1] : userMessage
 
@@ -162,7 +221,6 @@ export default function ChatbotTab() {
         })
         response = optimizeResponse.data.suggestions
       } else {
-        // Regular chat
         const chatResponse = await api.post('/chatbot/chat', {
           message: userMessage,
           resume_id: selectedResumeId || undefined
@@ -188,6 +246,11 @@ export default function ChatbotTab() {
   }
 
   const handleQuickAction = async (action: string) => {
+    if (isMultiMode) {
+      addMessage('assistant', 'Quick actions are available in single resume mode. Switch back to single mode to use them.')
+      return
+    }
+
     if (!selectedResumeId) {
       addMessage('assistant', 'Please upload or select a resume first.')
       return
@@ -223,40 +286,122 @@ export default function ChatbotTab() {
           </div>
         </div>
 
-        {/* Resume Selection */}
-        <div className="mb-4">
-          <label className="block text-slate-300 mb-2 text-sm">Select Resume (Optional)</label>
-          <div className="flex space-x-2">
-            <select
-              value={selectedResumeId}
-              onChange={(e) => setSelectedResumeId(e.target.value)}
-              className="neo-input flex-1"
-            >
-              <option value="">-- Select a resume --</option>
-              {resumes.map((resume) => (
-                <option key={resume.id} value={resume.id}>
-                  {resume.filename}
-                </option>
-              ))}
-            </select>
-            {selectedResumeId && (
+        {/* Chat Mode Toggle */}
+        <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-slate-300 text-sm">Chat Mode</span>
+            <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-1 flex">
               <motion.button
-                onClick={() => {
-                  setSelectedResumeId('')
-                  setUploadedFile(null)
-                }}
-                className="px-4 py-2 rounded-xl text-slate-400 hover:text-white transition-colors"
-                style={{
-                  background: 'rgba(59, 130, 246, 0.1)',
-                  border: '1px solid rgba(59, 130, 246, 0.3)',
-                }}
-                whileHover={{ scale: 1.05 }}
+                onClick={() => handleChatModeChange('single')}
+                className={`px-3 py-1.5 text-xs md:text-sm rounded-lg transition-colors ${
+                  !isMultiMode ? 'bg-blue-600 text-white' : 'text-slate-300 hover:text-white'
+                }`}
                 whileTap={{ scale: 0.95 }}
               >
-                <X size={18} />
+                Single
               </motion.button>
-            )}
+              <motion.button
+                onClick={() => handleChatModeChange('multi')}
+                className={`px-3 py-1.5 text-xs md:text-sm rounded-lg transition-colors ${
+                  isMultiMode ? 'bg-blue-600 text-white' : 'text-slate-300 hover:text-white'
+                }`}
+                whileTap={{ scale: 0.95 }}
+              >
+                Multi
+              </motion.button>
+            </div>
           </div>
+          <p className="text-xs text-slate-500 md:text-right">
+            {isMultiMode
+              ? 'Ask comparative questions across multiple resumes to spot strengths and gaps.'
+              : 'Focus on one resume at a time for deeper analysis and optimization.'}
+          </p>
+        </div>
+
+        {/* Resume Selection */}
+        <div className="mb-4">
+          <label className="block text-slate-300 mb-2 text-sm">
+            {isMultiMode ? 'Select resumes to include' : 'Select Resume (Optional)'}
+          </label>
+          {isMultiMode ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {resumes.length === 0 && (
+                  <div className="text-slate-400 text-sm">
+                    Upload resumes to start a multi-resume conversation.
+                  </div>
+                )}
+                {resumes.map((resume) => {
+                  const selected = isResumeSelected(resume.id)
+                  return (
+                    <motion.button
+                      key={resume.id}
+                      onClick={() => toggleMultiResume(resume.id)}
+                      className={`flex items-center justify-between rounded-xl border px-4 py-3 text-left transition-colors ${
+                        selected
+                          ? 'border-blue-500 bg-blue-500/15 text-white'
+                          : 'border-slate-700 bg-slate-800/60 text-slate-300 hover:border-blue-500/60 hover:text-white'
+                      }`}
+                      whileHover={{ scale: selected ? 1 : 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="rounded-lg bg-slate-900/60 p-2">
+                          <FileText size={18} />
+                        </div>
+                        <div>
+                          <p className="text-sm font-medium">{resume.filename}</p>
+                          <p className="text-xs text-slate-400">Uploaded {new Date(resume.upload_date).toLocaleDateString()}</p>
+                        </div>
+                      </div>
+                      {selected ? (
+                        <span className="flex items-center gap-1 text-xs text-blue-300">
+                          <Users size={14} /> Selected
+                        </span>
+                      ) : (
+                        <span className="text-xs text-slate-500">Tap to include</span>
+                      )}
+                    </motion.button>
+                  )
+                })}
+              </div>
+              <p className="text-xs text-slate-500">
+                Selected {multiResumeIds.length} of {resumes.length} resumes.
+              </p>
+            </div>
+          ) : (
+            <div className="flex space-x-2">
+              <select
+                value={selectedResumeId}
+                onChange={(e) => setSelectedResumeId(e.target.value)}
+                className="neo-input flex-1"
+              >
+                <option value="">-- Select a resume --</option>
+                {resumes.map((resume) => (
+                  <option key={resume.id} value={resume.id}>
+                    {resume.filename}
+                  </option>
+                ))}
+              </select>
+              {selectedResumeId && (
+                <motion.button
+                  onClick={() => {
+                    setSelectedResumeId('')
+                    setUploadedFile(null)
+                  }}
+                  className="px-4 py-2 rounded-xl text-slate-400 hover:text-white transition-colors"
+                  style={{
+                    background: 'rgba(59, 130, 246, 0.1)',
+                    border: '1px solid rgba(59, 130, 246, 0.3)',
+                  }}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                >
+                  <X size={18} />
+                </motion.button>
+              )}
+            </div>
+          )}
         </div>
 
         {/* File Upload */}
@@ -286,7 +431,7 @@ export default function ChatbotTab() {
 
         {/* Quick Actions */}
         <AnimatePresence>
-          {selectedResumeId && (
+          {!isMultiMode && selectedResumeId && (
             <motion.div 
               className="mb-4"
               initial={{ opacity: 0, height: 0 }}

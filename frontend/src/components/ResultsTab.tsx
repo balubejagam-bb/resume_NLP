@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useResumes } from '../hooks/useResumes'
 import { Search, Star, TrendingUp, Clock, Loader2, CheckCircle, AlertCircle, Settings, Sparkles, FileSearch, X } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import api from '../api/axios'
-import { Analysis } from '../types'
+import { Analysis, BulkAnalyzeResponse } from '../types'
 import { getErrorMessage } from '../utils/errorHandler'
 import { getAnalysisSettings } from './SettingsTab'
 
@@ -20,12 +20,17 @@ export default function ResultsTab() {
   const [showAnalysisOptions, setShowAnalysisOptions] = useState(false)
   const [useSettings, setUseSettings] = useState(true)
   const [showModePrompt, setShowModePrompt] = useState(false)
+  const [bulkLoading, setBulkLoading] = useState(false)
+  const [bulkSummary, setBulkSummary] = useState<BulkAnalyzeResponse | null>(null)
+  const [selectedBulkResumeIds, setSelectedBulkResumeIds] = useState<string[]>([])
   const [analysisProgress, setAnalysisProgress] = useState<{
     status: 'idle' | 'parsing' | 'analyzing' | 'scoring' | 'complete' | 'error';
     message: string;
     startTime?: number;
     elapsedTime?: number;
   }>({ status: 'idle', message: '' })
+  const bulkSelectionInitialized = useRef(false)
+  const allResumeIds = useMemo(() => resumes.map(resume => resume.id), [resumes])
 
   useEffect(() => {
     if (selectedResume) {
@@ -42,6 +47,36 @@ export default function ResultsTab() {
       setShowModePrompt(false)
     }
   }, [selectedResume])
+
+  useEffect(() => {
+    setSelectedBulkResumeIds(prev => {
+      const filtered = prev.filter(id => allResumeIds.includes(id))
+      if (!bulkSelectionInitialized.current && allResumeIds.length > 0) {
+        bulkSelectionInitialized.current = true
+        return allResumeIds
+      }
+      return filtered
+    })
+  }, [allResumeIds])
+
+  const selectedBulkCount = selectedBulkResumeIds.length
+  const isAllSelected = selectedBulkCount > 0 && selectedBulkCount === allResumeIds.length
+
+  const toggleBulkResume = (resumeId: string) => {
+    setSelectedBulkResumeIds(prev =>
+      prev.includes(resumeId)
+        ? prev.filter(id => id !== resumeId)
+        : [...prev, resumeId]
+    )
+  }
+
+  const handleSelectAllBulk = () => {
+    setSelectedBulkResumeIds(allResumeIds)
+  }
+
+  const handleClearBulkSelection = () => {
+    setSelectedBulkResumeIds([])
+  }
 
   const fetchAnalysis = async (resumeId: string, options: { promptOnExisting?: boolean } = {}) => {
     const { promptOnExisting = false } = options
@@ -209,6 +244,59 @@ export default function ResultsTab() {
   )
 
   const selectedAnalysis = analyses.find(a => a.resume_id === selectedResume)
+  const analyzeButtonLabel = isAllSelected ? 'Analyze All Resumes' : 'Analyze Selected'
+  const bulkActionDisabled = bulkLoading || resumes.length === 0 || selectedBulkResumeIds.length === 0
+
+  const handleBulkAnalyze = async () => {
+    if (resumes.length === 0) {
+      setError('Upload at least one resume before running bulk analysis.')
+      return
+    }
+
+    if (selectedBulkResumeIds.length === 0) {
+      setError('Select at least one resume to run bulk analysis.')
+      return
+    }
+
+    setBulkLoading(true)
+    try {
+      const response = await api.post('/analyses/bulk', {
+        resume_ids: selectedBulkResumeIds,
+        auto_mark_best: true
+      })
+      const data: BulkAnalyzeResponse = response.data
+
+      const normalizedAnalyses: Analysis[] = data.analyses.map(item => ({
+        id: item.analysis_id,
+        resume_id: item.resume_id,
+        filename: item.filename,
+        component_scores: item.component_scores,
+        gemini_analysis: item.gemini_analysis,
+        created_at: new Date(item.created_at).toISOString(),
+        is_best: item.is_best
+      }))
+
+      setAnalyses(prev => {
+        const map = new Map<string, Analysis>()
+        prev.forEach(a => map.set(a.resume_id, a))
+        normalizedAnalyses.forEach(a => map.set(a.resume_id, a))
+        return Array.from(map.values()).sort((a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+        )
+      })
+
+      if (data.best_resume) {
+        setSelectedResume(data.best_resume.resume_id)
+      }
+
+      setBulkSummary(data)
+      setError(null)
+    } catch (err: any) {
+      setError(getErrorMessage(err))
+    } finally {
+      setBulkLoading(false)
+    }
+  }
 
   // Animation variants
   const cardVariants = {
@@ -250,6 +338,98 @@ export default function ResultsTab() {
           </div>
         </div>
         
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+          <div className="space-y-2">
+            <p className="text-slate-400 text-sm">
+              Need a bird's-eye view? Run a full portfolio analysis and let AI highlight the strongest resume automatically.
+            </p>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <span className="px-2 py-1 rounded-lg bg-slate-800/60 border border-slate-700">
+                Selected {selectedBulkCount} of {resumes.length} resumes
+              </span>
+              <button
+                onClick={handleSelectAllBulk}
+                disabled={isAllSelected || resumes.length === 0}
+                className={`px-2 py-1 rounded-lg border transition-colors ${
+                  isAllSelected || resumes.length === 0
+                    ? 'border-slate-800 text-slate-600 cursor-not-allowed'
+                    : 'border-slate-700 hover:border-blue-400 hover:text-white'
+                }`}
+              >
+                Select All
+              </button>
+              <button
+                onClick={handleClearBulkSelection}
+                disabled={selectedBulkCount === 0}
+                className={`px-2 py-1 rounded-lg border transition-colors ${
+                  selectedBulkCount === 0
+                    ? 'border-slate-800 text-slate-600 cursor-not-allowed'
+                    : 'border-slate-700 hover:border-rose-400 hover:text-white'
+                }`}
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          <motion.button
+            onClick={() => void handleBulkAnalyze()}
+            disabled={bulkActionDisabled}
+            className={`neo-button flex items-center justify-center gap-2 ${bulkActionDisabled ? 'opacity-60 cursor-not-allowed' : ''}`}
+            whileHover={{ scale: bulkActionDisabled ? 1 : 1.05 }}
+            whileTap={{ scale: bulkActionDisabled ? 1 : 0.95 }}
+          >
+            {bulkLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Sparkles className="w-4 h-4" />
+            )}
+            <span>{bulkLoading ? 'Analyzing...' : analyzeButtonLabel}</span>
+          </motion.button>
+        </div>
+
+        <AnimatePresence>
+          {bulkSummary && (
+            <motion.div
+              className="gradient-border-card p-4 mb-6"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+                <div>
+                  <h3 className="text-white font-semibold text-lg">Bulk Analysis Summary</h3>
+                  <p className="text-slate-400 text-sm mt-1">
+                    Reviewed {bulkSummary.analyzed_count} of {bulkSummary.total_resumes} resumes.
+                    {bulkSummary.job_description_provided ? ' Job preferences were applied.' : ' No job description was supplied.'}
+                  </p>
+                  {bulkSummary.failures.length > 0 && (
+                    <div className="mt-3 text-xs text-red-300 space-y-1">
+                      <p className="font-medium">Unable to analyze:</p>
+                      {bulkSummary.failures.map(failure => (
+                        <p key={failure.resume_id}>
+                          • {failure.filename ?? failure.resume_id}: {failure.error}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {bulkSummary.best_resume && (
+                  <div className="md:text-right">
+                    <p className="text-slate-400 text-sm">Recommended Resume</p>
+                    <p className="text-white font-semibold text-base mt-1">{bulkSummary.best_resume.filename}</p>
+                    <p className="text-slate-500 text-sm">
+                      Composite Score: {bulkSummary.best_resume.final_score.toFixed(1)}
+                    </p>
+                    {bulkSummary.best_resume_reason && (
+                      <p className="text-slate-500/70 text-xs mt-2">{bulkSummary.best_resume_reason}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Search Input */}
         <div className="relative mb-6">
           <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 text-slate-500" size={20} />
@@ -290,6 +470,7 @@ export default function ResultsTab() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {filteredResumes.map((resume, index) => {
               const analysis = analyses.find(a => a.resume_id === resume.id)
+              const isBulkSelected = selectedBulkResumeIds.includes(resume.id)
               return (
                 <motion.div
                   key={resume.id}
@@ -302,6 +483,8 @@ export default function ResultsTab() {
                     selectedResume === resume.id
                       ? 'ring-2 ring-blue-500'
                       : ''
+                  } ${
+                    isBulkSelected ? 'border border-blue-500/40' : ''
                   }`}
                   style={{
                     background: selectedResume === resume.id 
@@ -311,15 +494,32 @@ export default function ResultsTab() {
                   onClick={() => setSelectedResume(resume.id)}
                 >
                   <div className="flex items-start justify-between mb-2">
-                    <h3 className="text-white font-semibold truncate flex-1">{resume.filename}</h3>
-                    {analysis?.is_best && (
-                      <motion.div
-                        animate={{ rotate: [0, 10, -10, 0] }}
-                        transition={{ duration: 0.5, repeat: Infinity, repeatDelay: 3 }}
+                    <h3 className="text-white font-semibold truncate flex-1 mr-2">{resume.filename}</h3>
+                    <div className="flex items-center gap-2">
+                      <motion.button
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          toggleBulkResume(resume.id)
+                        }}
+                        className={`text-xs px-2 py-1 rounded-lg border transition-colors ${
+                          isBulkSelected
+                            ? 'border-blue-400 bg-blue-500/20 text-blue-200'
+                            : 'border-slate-700 text-slate-400 hover:border-blue-400 hover:text-white'
+                        }`}
+                        whileHover={{ scale: 1.05 }}
+                        whileTap={{ scale: 0.95 }}
                       >
-                        <Star className="text-yellow-400 fill-yellow-400 ml-2" size={20} />
-                      </motion.div>
-                    )}
+                        {isBulkSelected ? 'Included' : 'Include'}
+                      </motion.button>
+                      {analysis?.is_best && (
+                        <motion.div
+                          animate={{ rotate: [0, 10, -10, 0] }}
+                          transition={{ duration: 0.5, repeat: Infinity, repeatDelay: 3 }}
+                        >
+                          <Star className="text-yellow-400 fill-yellow-400" size={20} />
+                        </motion.div>
+                      )}
+                    </div>
                   </div>
                   <div className="flex flex-wrap gap-2 mb-3">
                     {resume.skills.slice(0, 3).map((skill, i) => (

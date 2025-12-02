@@ -114,3 +114,96 @@ class OntologyUpload(BaseModel):
     skills: List[str]
     job_titles: List[str]
     industries: List[str]
+
+
+class JobCatalogEntry(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    title: str
+    company: Optional[str] = None
+    location: Optional[str] = None
+    category: str = "general"
+    description: str
+    requirements: List[str] = Field(default_factory=list)
+    skills: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+
+
+class JobRecommendation(JobCatalogEntry):
+    similarity_score: float = Field(..., ge=0)
+    probability_score: float = Field(..., ge=0)
+    final_score: float = Field(..., ge=0)
+
+
+class JobRecommendationResponse(BaseModel):
+    resume_id: Optional[str] = None
+    used_inline_resume_text: bool = False
+    total_jobs_considered: int = 0
+    recommendations: List[JobRecommendation] = Field(default_factory=list)
+
+
+class JobCatalogResponse(BaseModel):
+    total_jobs: int
+    jobs: List[JobCatalogEntry]
+
+
+class JobRecommendationRequest(BaseModel):
+    resume_id: Optional[str] = None
+    resume_text: Optional[str] = None
+    top_n: int = Field(default=5, ge=1, le=20)
+
+
+class BulkAnalysisItem(BaseModel):
+    analysis_id: str
+    resume_id: str
+    filename: str
+    ats_score: float
+    match_percentage: float
+    final_score: float
+    is_best: bool = False
+    created_at: datetime
+    component_scores: ComponentScore
+    gemini_analysis: GeminiAnalysis
+
+
+class BulkAnalysisFailure(BaseModel):
+    resume_id: str
+    filename: Optional[str] = None
+    error: str
+
+
+class BulkAnalyzeRequest(BaseModel):
+    resume_ids: List[str] = Field(default_factory=list)
+    job_description: Optional[str] = None
+    analysis_focus: Optional[str] = None
+    auto_mark_best: bool = True
+
+
+class BulkAnalyzeResponse(BaseModel):
+    total_resumes: int
+    analyzed_count: int
+    job_description_provided: bool
+    best_resume: Optional[BulkAnalysisItem] = None
+    best_resume_reason: Optional[str] = None
+    analyses: List[BulkAnalysisItem] = Field(default_factory=list)
+    failures: List[BulkAnalysisFailure] = Field(default_factory=list)
+
+
+class ChatResumeContext(BaseModel):
+    id: str
+    filename: Optional[str] = None
+    source: str
+
+
+class ChatbotMultiRequest(BaseModel):
+    message: str
+    resume_ids: List[str] = Field(default_factory=list)
+    resume_texts: List[str] = Field(default_factory=list)
+    job_description: Optional[str] = None
+
+
+class ChatbotMultiResponse(BaseModel):
+    response: str
+    resume_count: int
+    resumes: List[ChatResumeContext]

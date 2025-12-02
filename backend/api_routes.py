@@ -1,9 +1,10 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query, Header
 from fastapi.responses import JSONResponse, FileResponse
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import logging
 from datetime import datetime
 from bson import ObjectId
+from bson.errors import InvalidId
 import json
 import csv
 from io import StringIO
@@ -12,7 +13,11 @@ from database import get_db
 from models import (
     ResumeUpload, ResumeAnalysis, ATSRequest, FeedbackRequest,
     ExportRequest, DashboardResponse, OntologyUpload, ComponentScore,
-    AnalyzeSingleRequest, ChatbotRequest, AnalysisSettingsPayload
+    AnalyzeSingleRequest, ChatbotRequest, AnalysisSettingsPayload,
+    JobRecommendationRequest, JobRecommendationResponse, JobCatalogResponse,
+    JobRecommendation, BulkAnalyzeRequest, BulkAnalyzeResponse,
+    BulkAnalysisItem, BulkAnalysisFailure, ChatbotMultiRequest,
+    ChatbotMultiResponse, ChatResumeContext
 )
 from storage import save_uploaded_file, get_file_path, delete_file, get_file_size
 from parser import parse_resume
@@ -20,6 +25,7 @@ from nlp_processor import process_resume_text, detect_duplicates
 from scorer import calculate_scores
 from gemini_service import analyze_with_gemini
 from chatbot_service import chat_with_resume, analyze_resume_via_chat, get_resume_optimization_suggestions
+from job_recommender import job_recommender
 from config import settings
 from auth import (
     UserRegister, UserLogin, AuthResponse,
@@ -28,6 +34,158 @@ from auth import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _compute_composite_score(component_scores: Dict[str, float], gemini_analysis: Dict[str, Any]) -> float:
+    ats_score = float(gemini_analysis.get("ats_score") or 0)
+    match_percentage = float(gemini_analysis.get("match_percentage") or 0)
+    skill_match = float(component_scores.get("skill_match") or 0)
+    score = (0.5 * ats_score) + (0.3 * match_percentage) + (0.2 * skill_match)
+    return round(score, 2)
+
+
+async def _create_analysis_record(
+    db,
+    resume: Dict[str, Any],
+    job_description: Optional[str],
+    analysis_focus: Optional[str],
+    job_keywords: List[str]
+) -> Dict[str, Any]:
+    component_scores_model = calculate_scores(
+        resume["parsed_text"],
+        resume.get("skills", []),
+        resume.get("experience_years", 0),
+        resume.get("education", []),
+        job_keywords or None
+    )
+    component_scores_dict = component_scores_model.dict()
+
+    enhanced_job_desc = job_description
+    if analysis_focus and job_description:
+        enhanced_job_desc = f"{job_description}\n\nAnalysis Focus: {analysis_focus}"
+    elif analysis_focus:
+        enhanced_job_desc = f"Analysis Focus: {analysis_focus}"
+
+    gemini_analysis_model = await analyze_with_gemini(
+        resume["parsed_text"],
+        enhanced_job_desc
+    )
+    gemini_analysis_dict = gemini_analysis_model.dict()
+
+    created_at = datetime.utcnow()
+
+    analysis_doc = {
+        "resume_id": str(resume["_id"]),
+        "filename": resume.get("filename", "Unknown"),
+        "component_scores": component_scores_dict,
+        "gemini_analysis": gemini_analysis_dict,
+        "created_at": created_at,
+        "is_best": False
+    }
+
+    result = await db.analyses.insert_one(analysis_doc)
+
+    final_score = _compute_composite_score(component_scores_dict, gemini_analysis_dict)
+
+    return {
+        "analysis_id": str(result.inserted_id),
+        "resume_id": str(resume["_id"]),
+        "filename": resume.get("filename", "Unknown"),
+        "ats_score": float(gemini_analysis_dict.get("ats_score", 0)),
+        "match_percentage": float(gemini_analysis_dict.get("match_percentage", 0)),
+        "final_score": final_score,
+        "is_best": False,
+        "created_at": created_at,
+        "component_scores": component_scores_dict,
+        "gemini_analysis": gemini_analysis_dict
+    }
+
+
+@router.post("/analyses/bulk", response_model=BulkAnalyzeResponse)
+async def analyze_resumes_bulk(
+    payload: BulkAnalyzeRequest,
+    db = Depends(get_db)
+):
+    """Analyze multiple resumes in one request and surface the best candidate automatically."""
+    try:
+        query: Dict[str, Any] = {}
+        resume_ids = payload.resume_ids or []
+        if resume_ids:
+            try:
+                id_list = [ObjectId(rid) for rid in resume_ids]
+            except InvalidId:
+                raise HTTPException(status_code=400, detail="One or more resume_ids are invalid.")
+            query = {"_id": {"$in": id_list}}
+
+        resumes = await db.resumes.find(query).to_list(length=1000)
+        if not resumes:
+            raise HTTPException(status_code=404, detail="No resumes found for analysis.")
+
+        job_description = (payload.job_description or "").strip()
+        job_keywords: List[str] = []
+        if job_description:
+            job_keywords = process_resume_text(job_description)["skills"]
+
+        analyses_payload: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+        best_entry: Optional[Dict[str, Any]] = None
+
+        for resume in resumes:
+            try:
+                analysis_data = await _create_analysis_record(
+                    db=db,
+                    resume=resume,
+                    job_description=job_description if job_description else None,
+                    analysis_focus=payload.analysis_focus,
+                    job_keywords=job_keywords
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.error(f"Bulk analysis failed for resume {resume.get('_id')}: {exc}")
+                failures.append({
+                    "resume_id": str(resume.get("_id")),
+                    "filename": resume.get("filename"),
+                    "error": str(exc)
+                })
+                continue
+
+            analyses_payload.append(analysis_data)
+            if best_entry is None or analysis_data["final_score"] > best_entry["final_score"]:
+                best_entry = analysis_data
+
+        if not analyses_payload:
+            raise HTTPException(status_code=500, detail="All analyses failed. See failure details.")
+
+        if payload.auto_mark_best and best_entry:
+            await db.analyses.update_many({"is_best": True}, {"$set": {"is_best": False}})
+            await db.analyses.update_one(
+                {"_id": ObjectId(best_entry["analysis_id"])},
+                {"$set": {"is_best": True}}
+            )
+            for item in analyses_payload:
+                item["is_best"] = item["analysis_id"] == best_entry["analysis_id"]
+            best_entry["is_best"] = True
+
+        analyses_models = [BulkAnalysisItem(**item) for item in analyses_payload]
+        failure_models = [BulkAnalysisFailure(**item) for item in failures]
+        best_model = BulkAnalysisItem(**best_entry) if best_entry else None
+
+        return BulkAnalyzeResponse(
+            total_resumes=len(resumes),
+            analyzed_count=len(analyses_models),
+            job_description_provided=bool(job_description),
+            best_resume=best_model,
+            best_resume_reason="Selected using highest composite score weighted by ATS score, match percentage, and skill alignment."
+            if best_model else None,
+            analyses=analyses_models,
+            failures=failure_models
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error performing bulk analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== AUTH ROUTES ====================
@@ -781,4 +939,115 @@ async def chatbot_optimize(
     except Exception as e:
         logger.error(f"Error getting optimization suggestions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/chatbot/chat-multi", response_model=ChatbotMultiResponse)
+async def chatbot_chat_multi(
+    request: ChatbotMultiRequest,
+    db = Depends(get_db)
+):
+    """Chat with AI about multiple resumes simultaneously."""
+    try:
+        if not request.message or not request.message.strip():
+            raise HTTPException(status_code=400, detail="A message prompt is required.")
+
+        combined_sections: List[str] = []
+        context_entries: List[ChatResumeContext] = []
+
+        if request.resume_ids:
+            try:
+                id_list = [ObjectId(rid) for rid in request.resume_ids]
+            except InvalidId:
+                raise HTTPException(status_code=400, detail="One or more resume_ids are invalid.")
+
+            resumes = await db.resumes.find({"_id": {"$in": id_list}}).to_list(length=1000)
+            resume_map = {str(r["_id"]): r for r in resumes}
+            missing = [rid for rid in request.resume_ids if rid not in resume_map]
+            if missing:
+                raise HTTPException(status_code=404, detail=f"Resumes not found: {', '.join(missing)}")
+
+            for rid in request.resume_ids:
+                resume = resume_map[rid]
+                resume_text = (resume.get("parsed_text") or "").strip()
+                if not resume_text:
+                    continue
+                filename = resume.get("filename", "Unknown")
+                combined_sections.append(f"=== Resume {filename} (ID: {rid}) ===\n{resume_text}")
+                context_entries.append(ChatResumeContext(id=rid, filename=filename, source="database"))
+
+        for idx, raw_text in enumerate(request.resume_texts, start=1):
+            text = (raw_text or "").strip()
+            if not text:
+                continue
+            combined_sections.append(f"=== Inline Resume #{idx} ===\n{text}")
+            context_entries.append(ChatResumeContext(id=f"inline-{idx}", filename=None, source="inline"))
+
+        if not combined_sections:
+            raise HTTPException(status_code=400, detail="No resume content provided for multi-resume chat.")
+
+        combined_resume_text = "\n\n".join(combined_sections)
+        response_text = await chat_with_resume(
+            user_message=request.message,
+            resume_text=combined_resume_text,
+            job_description=request.job_description
+        )
+
+        return ChatbotMultiResponse(
+            response=response_text,
+            resume_count=len(context_entries),
+            resumes=context_entries
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in multi-resume chatbot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/jobs/catalog", response_model=JobCatalogResponse)
+async def get_job_catalog():
+    """Return the static job catalog used by the recommender."""
+    jobs = job_recommender.list_jobs()
+    return JobCatalogResponse(total_jobs=len(jobs), jobs=jobs)
+
+
+@router.post("/jobs/recommend", response_model=JobRecommendationResponse)
+async def recommend_jobs(
+    payload: JobRecommendationRequest,
+    db = Depends(get_db)
+):
+    """Recommend relevant jobs for a resume using hybrid ML + similarity scoring."""
+    catalog = job_recommender.list_jobs()
+    if not catalog:
+        raise HTTPException(status_code=503, detail="Job catalog is unavailable. Add entries to backend/data/job_dataset.json.")
+
+    if not payload.resume_text and not payload.resume_id:
+        raise HTTPException(status_code=400, detail="Provide either resume_text or resume_id for recommendations.")
+
+    resume_text = (payload.resume_text or "").strip()
+    used_inline = bool(resume_text)
+    resume_id = payload.resume_id
+
+    if not resume_text:
+        if not resume_id:
+            raise HTTPException(status_code=400, detail="Resume text is empty and resume_id was not supplied.")
+        try:
+            resume = await db.resumes.find_one({"_id": ObjectId(resume_id)})
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.error(f"Invalid resume_id provided for recommendations: {exc}")
+            raise HTTPException(status_code=400, detail="Invalid resume_id.")
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found.")
+        resume_text = resume.get("parsed_text", "").strip()
+        if not resume_text:
+            raise HTTPException(status_code=400, detail="Resume does not contain parsed text for analysis.")
+
+    recommendations = job_recommender.recommend(resume_text=resume_text, top_n=payload.top_n)
+
+    return JobRecommendationResponse(
+        resume_id=resume_id,
+        used_inline_resume_text=used_inline,
+        total_jobs_considered=len(catalog),
+        recommendations=[JobRecommendation(**item) for item in recommendations]
+    )
 
