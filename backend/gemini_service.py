@@ -16,7 +16,7 @@ if settings.GEMINI_API_KEY:
 else:
     logger.warning("GEMINI_API_KEY not set. Gemini features will not work.")
 
-def get_gemini_model():
+def get_gemini_model(model_name: Optional[str] = None):
     """Get Gemini model instance with configuration"""
     try:
         generation_config = {
@@ -24,7 +24,7 @@ def get_gemini_model():
             "max_output_tokens": settings.GEMINI_MAX_TOKENS,
         }
         return genai.GenerativeModel(
-            settings.GEMINI_MODEL,
+            model_name or settings.GEMINI_MODEL,
             generation_config=generation_config
         )
     except Exception as e:
@@ -79,7 +79,38 @@ async def analyze_with_gemini(resume_text: str, job_description: str = None, max
     for attempt in range(max_retries):
         try:
             logger.info(f"Calling Gemini API for real-time analysis (attempt {attempt + 1}/{max_retries})...")
-            model = get_gemini_model()
+            # Try configured model first, then fallbacks for availability
+            candidate_models: List[str] = []
+            if settings.GEMINI_MODEL:
+                candidate_models.append(settings.GEMINI_MODEL)
+            candidate_models.extend([
+                "gemini-1.5-flash-8b",
+                "gemini-1.0-pro",
+            ])
+            seen = set()
+            candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
+
+            response = None
+            response_text = ""
+
+            for model_name in candidate_models:
+                try:
+                    logger.info(f"Sending request to Gemini API using model {model_name}...")
+                    model = get_gemini_model(model_name)
+                    response = model.generate_content(prompt)
+                    response_text = response.text
+                    logger.info(f"Received response from Gemini API (model {model_name})")
+                    break
+                except Exception as model_err:
+                    last_error = model_err
+                    err_str = str(model_err).lower()
+                    if "404" in err_str or "not found" in err_str:
+                        logger.warning(f"Model {model_name} unavailable: {model_err}")
+                        continue
+                    raise
+
+            if response is None:
+                raise last_error or RuntimeError("No Gemini model responded")
             
             # Use full resume text (not truncated) for better analysis
             resume_content = resume_text[:8000]
