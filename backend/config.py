@@ -2,6 +2,10 @@ from pydantic_settings import BaseSettings
 from typing import List
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file before anything else
+load_dotenv()
 
 class Settings(BaseSettings):
     # MongoDB Atlas Connection
@@ -19,8 +23,8 @@ class Settings(BaseSettings):
     MAX_FILES: int = 15
     
     # Gemini AI
-    GEMINI_API_KEY: str = "AIzaSyB1NZlWsTGt7jsZm9wDKpyFuufC8X5qLIU"
-    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_API_KEY: str = "AIzaSyA4iQQCpsA7av7TsI83sUpwhP4zg30FlZ8"
+    GEMINI_MODEL: str = "gemini-1.5-flash-latest"
     GEMINI_TEMPERATURE: float = 0.35
     GEMINI_MAX_TOKENS: int = 2500
     

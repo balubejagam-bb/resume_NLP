@@ -8,6 +8,10 @@ from bson.errors import InvalidId
 import json
 import csv
 from io import StringIO
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
 
 from database import get_db
 from models import (

@@ -4,6 +4,11 @@ import logging
 import time
 import json
 import re
+from dotenv import load_dotenv
+
+# Load .env file before importing settings
+load_dotenv()
+
 from config import settings
 from models import GeminiAnalysis, KeywordAnalysis, SectionAnalysis
 from prompts import ATS_ANALYSIS_PROMPT, CHATBOT_SYSTEM_PROMPT, RESUME_OPTIMIZATION_PROMPT
@@ -84,11 +89,27 @@ async def analyze_with_gemini(resume_text: str, job_description: str = None, max
             if settings.GEMINI_MODEL:
                 candidate_models.append(settings.GEMINI_MODEL)
             candidate_models.extend([
-                "gemini-1.5-flash-8b",
+                "gemini-1.5-flash-latest",
+                "gemini-1.5-pro-latest",
                 "gemini-1.0-pro",
             ])
             seen = set()
             candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
+
+            # Use full resume text (not truncated) for better analysis
+            resume_content = resume_text[:8000]
+            
+            job_desc_section = ""
+            if job_description:
+                job_desc_section = f"\n\nJob Description/Requirements:\n{job_description[:3000]}\n"
+            else:
+                job_desc_section = "\n\nNote: No specific job description provided. Provide general ATS analysis.\n"
+            
+            # Use prompt template
+            prompt = ATS_ANALYSIS_PROMPT.format(
+                resume_text=resume_content,
+                job_description_section=job_desc_section
+            )
 
             response = None
             response_text = ""
@@ -111,27 +132,6 @@ async def analyze_with_gemini(resume_text: str, job_description: str = None, max
 
             if response is None:
                 raise last_error or RuntimeError("No Gemini model responded")
-            
-            # Use full resume text (not truncated) for better analysis
-            resume_content = resume_text[:8000]
-            
-            job_desc_section = ""
-            if job_description:
-                job_desc_section = f"\n\nJob Description/Requirements:\n{job_description[:3000]}\n"
-            else:
-                job_desc_section = "\n\nNote: No specific job description provided. Provide general ATS analysis.\n"
-            
-            # Use prompt template
-            prompt = ATS_ANALYSIS_PROMPT.format(
-                resume_text=resume_content,
-                job_description_section=job_desc_section
-            )
-            
-            # Make actual API call to Gemini
-            logger.info("Sending request to Gemini API...")
-            response = model.generate_content(prompt)
-            response_text = response.text
-            logger.info("Received response from Gemini API")
             
             # Parse JSON from response
             data = parse_gemini_json_response(response_text)
