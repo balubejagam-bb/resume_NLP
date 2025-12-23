@@ -1,4 +1,9 @@
-import google.generativeai as genai
+from google import genai
+try:
+    import google.generativeai as genai_legacy
+except ImportError:
+    genai_legacy = None
+
 from typing import Dict, List, Optional
 import logging
 import time
@@ -15,26 +20,31 @@ from prompts import ATS_ANALYSIS_PROMPT, CHATBOT_SYSTEM_PROMPT, RESUME_OPTIMIZAT
 
 logger = logging.getLogger(__name__)
 
-# Initialize Gemini (only if API key is provided)
+# Initialize GenAI client (only if API key is provided)
+client = None
 if settings.GEMINI_API_KEY:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
+    try:
+        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    except Exception as e:
+        logger.error(f"Error initializing GenAI client: {e}")
+        client = None
+    
+    # Configure legacy SDK if available
+    if genai_legacy:
+        try:
+            genai_legacy.configure(api_key=settings.GEMINI_API_KEY)
+        except Exception as e:
+            logger.error(f"Error configuring legacy GenAI: {e}")
 else:
     logger.warning("GEMINI_API_KEY not set. Gemini features will not work.")
 
 def get_gemini_model(model_name: Optional[str] = None):
-    """Get Gemini model instance with configuration"""
-    try:
-        generation_config = {
-            "temperature": settings.GEMINI_TEMPERATURE,
-            "max_output_tokens": settings.GEMINI_MAX_TOKENS,
-        }
-        return genai.GenerativeModel(
-            model_name or settings.GEMINI_MODEL,
-            generation_config=generation_config
-        )
-    except Exception as e:
-        logger.error(f"Error initializing Gemini model: {e}")
-        raise
+    """Return model name and generation config for use with the GenAI client"""
+    generation_config = {
+        "temperature": settings.GEMINI_TEMPERATURE,
+        "max_output_tokens": settings.GEMINI_MAX_TOKENS,
+    }
+    return (model_name or settings.GEMINI_MODEL, generation_config)
 
 def parse_gemini_json_response(response_text: str) -> dict:
     """Parse JSON from Gemini response, handling various formats"""
@@ -65,6 +75,154 @@ def parse_gemini_json_response(response_text: str) -> dict:
     
     raise ValueError("Could not parse JSON from response")
 
+
+def send_prompt_to_model(model_name: str, prompt: str, generation_config: dict) -> str:
+    """Send prompt to Gemini/GenAI using available client APIs and return text output.
+
+    Tries in order: 
+    1. client.models.generate_content (New SDK)
+    2. client.responses.create (New SDK early versions)
+    3. client.generate (New SDK alternative)
+    4. genai.GenerativeModel.generate_content (Old SDK via google.genai if available)
+    5. genai_legacy.GenerativeModel.generate_content (Old SDK via google.generativeai)
+    6. genai.responses.create (Module level)
+    7. genai.generate (Module level)
+    """
+    last_exc = None
+    attempts = []
+
+    # 1) Client-level models.generate_content (Standard for google-genai >= 0.9)
+    try:
+        if client is not None and hasattr(client, "models") and hasattr(client.models, "generate_content"):
+            # Adapt config keys if necessary. 
+            resp = client.models.generate_content(model=model_name, contents=prompt, config=generation_config)
+            if hasattr(resp, "text"):
+                return resp.text
+            return str(resp)
+        else:
+            attempts.append(("client.models.generate_content", "not available"))
+    except Exception as e:
+        last_exc = e
+        attempts.append(("client.models.generate_content", str(e)))
+
+    # 2) New Responses API on client
+    try:
+        if client is not None and hasattr(client, "responses") and hasattr(client.responses, "create"):
+            resp = client.responses.create(model=model_name, input=prompt, **generation_config)
+            if hasattr(resp, "output_text") and resp.output_text:
+                return resp.output_text
+            out = getattr(resp, "output", None)
+            if out:
+                pieces = []
+                if isinstance(out, list):
+                    for o in out:
+                        if isinstance(o, dict):
+                            for c in o.get("content", []):
+                                if isinstance(c, dict) and c.get("text"):
+                                    pieces.append(c.get("text"))
+                        elif isinstance(o, str):
+                            pieces.append(o)
+                elif isinstance(out, dict):
+                    for c in out.get("content", []):
+                        if isinstance(c, dict) and c.get("text"):
+                            pieces.append(c.get("text"))
+                if pieces:
+                    return "\n".join(pieces)
+            return str(resp)
+        else:
+            attempts.append(("client.responses.create", "not available"))
+    except Exception as e:
+        last_exc = e
+        attempts.append(("client.responses.create", str(e)))
+
+    # 3) Client-level generate (some versions)
+    try:
+        if client is not None and hasattr(client, "generate"):
+            resp = client.generate(model=model_name, prompt=prompt, **generation_config)
+            if hasattr(resp, "text"):
+                return resp.text
+            return str(resp)
+    except Exception as e:
+        last_exc = e
+        attempts.append(("client.generate", str(e)))
+
+    # 4) Legacy GenerativeModel (from older SDKs via google.genai)
+    try:
+        if hasattr(genai, "GenerativeModel"):
+            gen_model = genai.GenerativeModel(model_name, generation_config=generation_config)
+            resp = gen_model.generate_content(prompt)
+            if hasattr(resp, "text"):
+                return resp.text
+            return str(resp)
+    except Exception as e:
+        last_exc = e
+        attempts.append(("genai.GenerativeModel.generate_content", str(e)))
+
+    # 5) Legacy GenerativeModel (via google.generativeai)
+    try:
+        if genai_legacy and hasattr(genai_legacy, "GenerativeModel"):
+            gen_model = genai_legacy.GenerativeModel(model_name, generation_config=generation_config)
+            resp = gen_model.generate_content(prompt)
+            if hasattr(resp, "text"):
+                return resp.text
+            return str(resp)
+        else:
+            attempts.append(("genai_legacy.GenerativeModel.generate_content", "not available"))
+    except Exception as e:
+        last_exc = e
+        attempts.append(("genai_legacy.GenerativeModel.generate_content", str(e)))
+
+    # 6) Module-level Responses API (some genai versions expose this)
+    try:
+        if hasattr(genai, "responses") and hasattr(genai.responses, "create"):
+            resp = genai.responses.create(model=model_name, input=prompt, **generation_config)
+            if hasattr(resp, "output_text") and resp.output_text:
+                return resp.output_text
+            out = getattr(resp, "output", None)
+            if out:
+                pieces = []
+                if isinstance(out, list):
+                    for o in out:
+                        if isinstance(o, dict):
+                            for c in o.get("content", []):
+                                if isinstance(c, dict) and c.get("text"):
+                                    pieces.append(c.get("text"))
+                        elif isinstance(o, str):
+                            pieces.append(o)
+                elif isinstance(out, dict):
+                    for c in out.get("content", []):
+                        if isinstance(c, dict) and c.get("text"):
+                            pieces.append(c.get("text"))
+                if pieces:
+                    return "\n".join(pieces)
+            return str(resp)
+        else:
+            attempts.append(("genai.responses.create", "not available"))
+    except Exception as e:
+        last_exc = e
+        attempts.append(("genai.responses.create", str(e)))
+
+    # 7) Module-level genai.generate
+    try:
+        if hasattr(genai, "generate"):
+            resp = genai.generate(model=model_name, prompt=prompt, **generation_config)
+            if isinstance(resp, dict) and resp.get("output"):
+                out = resp.get("output")
+                if isinstance(out, str):
+                    return out
+                if isinstance(out, list):
+                    return "\n".join([str(i) for i in out])
+            if hasattr(resp, "text"):
+                return resp.text
+            return str(resp)
+    except Exception as e:
+        last_exc = e
+        attempts.append(("genai.generate", str(e)))
+
+    # If nothing worked, raise a helpful error with attempted methods
+    attempt_msgs = "; ".join([f"{name}: {msg}" for name, msg in attempts])
+    raise RuntimeError(f"No compatible GenAI generation API available. Attempts: {attempt_msgs}")
+
 async def analyze_with_gemini(resume_text: str, job_description: str = None, max_retries: int = 3) -> GeminiAnalysis:
     """Analyze resume using Gemini Pro - Real-time API call with retry logic"""
     if not settings.GEMINI_API_KEY:
@@ -84,14 +242,15 @@ async def analyze_with_gemini(resume_text: str, job_description: str = None, max
     for attempt in range(max_retries):
         try:
             logger.info(f"Calling Gemini API for real-time analysis (attempt {attempt + 1}/{max_retries})...")
-            # Try configured model first, then fallbacks for availability
+            # Try configured model first, then updated fallbacks for availability
             candidate_models: List[str] = []
             if settings.GEMINI_MODEL:
                 candidate_models.append(settings.GEMINI_MODEL)
+            # Updated (Dec 2025) recommended model names
             candidate_models.extend([
-                "gemini-1.5-flash-latest",
-                "gemini-1.5-pro-latest",
-                "gemini-1.0-pro",
+                "gemini-2.5-flash",
+                "gemini-3-pro-preview",
+                "gemini-2.5-flash-lite",
             ])
             seen = set()
             candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
@@ -111,15 +270,17 @@ async def analyze_with_gemini(resume_text: str, job_description: str = None, max
                 job_description_section=job_desc_section
             )
 
-            response = None
-            response_text = ""
+            response_text = None
 
             for model_name in candidate_models:
                 try:
-                    logger.info(f"Sending request to Gemini API using model {model_name}...")
-                    model = get_gemini_model(model_name)
-                    response = model.generate_content(prompt)
-                    response_text = response.text
+                    logger.info(f"Sending request to Gemini API using model {model_name} (API {getattr(settings, 'GEMINI_API_VERSION', 'v1')})...")
+                    generation_config = {
+                        "temperature": settings.GEMINI_TEMPERATURE,
+                        "max_output_tokens": settings.GEMINI_MAX_TOKENS,
+                    }
+                    response_text = send_prompt_to_model(model_name, prompt, generation_config)
+
                     logger.info(f"Received response from Gemini API (model {model_name})")
                     break
                 except Exception as model_err:
@@ -130,7 +291,7 @@ async def analyze_with_gemini(resume_text: str, job_description: str = None, max
                         continue
                     raise
 
-            if response is None:
+            if response_text is None:
                 raise last_error or RuntimeError("No Gemini model responded")
             
             # Parse JSON from response

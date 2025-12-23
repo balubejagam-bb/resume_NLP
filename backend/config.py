@@ -24,9 +24,11 @@ class Settings(BaseSettings):
     
     # Gemini AI
     GEMINI_API_KEY: str = "AIzaSyA4iQQCpsA7av7TsI83sUpwhP4zg30FlZ8"
-    GEMINI_MODEL: str = "gemini-1.5-flash-latest"
+    # Updated defaults (Dec 2025): prefer Gemini 2.5 / 3 models and v1 API
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_API_VERSION: str = "v1"
     GEMINI_TEMPERATURE: float = 0.35
-    GEMINI_MAX_TOKENS: int = 2500
+    GEMINI_MAX_TOKENS: int = 8092
     
     # NLP
     SPACY_MODEL: str = "en_core_web_sm"

@@ -11,6 +11,13 @@ from nlp_processor import process_resume_text
 
 logger = logging.getLogger(__name__)
 
+# Configure GenAI (Old SDK) if API key is present
+if settings.GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+    except Exception as e:
+        logger.warning(f"Could not configure google.generativeai: {e}")
+
 def get_chatbot_model():
     """Get Gemini model for chatbot with optimized settings"""
     try:
